@@ -2,10 +2,11 @@
 
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
-import { BookDetail, BookShelfItem } from '@/lib/book.types';
+import { buildBookReadPath, cacheBookDetail, getBookRouteCache } from '@/lib/book-route-cache.client';
 import { deleteBookShelf, getAllBookShelf, saveBookShelf } from '@/lib/book.db.client';
+import { BookDetail, BookShelfItem } from '@/lib/book.types';
 
 function DetailSkeleton() {
   return (
@@ -30,29 +31,79 @@ function DetailSkeleton() {
   );
 }
 
+async function openBookFile(sourceId: string, bookId: string, format?: 'epub' | 'pdf', download = false, href?: string) {
+  const response = await fetch('/api/books/file', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceId, bookId, format: format || null, href: href || undefined }),
+  });
+  if (!response.ok) {
+    let message = '打开文件失败';
+    try {
+      const json = await response.json();
+      message = json.error || message;
+    } catch {}
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  if (download) {
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = '';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } else {
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 export default function BookDetailPage() {
   const searchParams = useSearchParams();
   const sourceId = searchParams.get('sourceId') || '';
-  const href = searchParams.get('href') || '';
+  const bookId = searchParams.get('bookId') || '';
   const [detail, setDetail] = useState<BookDetail | null>(null);
   const [shelf, setShelf] = useState<Record<string, BookShelfItem>>({});
   const [error, setError] = useState('');
+  const [fileBusy, setFileBusy] = useState<'open' | 'download' | ''>('');
 
+  const cached = useMemo(() => (sourceId && bookId ? getBookRouteCache(sourceId, bookId) : null), [sourceId, bookId]);
 
   useEffect(() => {
-    getAllBookShelf().then(setShelf).catch(() => undefined);
+    getAllBookShelf().then((items) => {
+      setShelf(items);
+    }).catch(() => undefined);
   }, []);
 
   useEffect(() => {
-    const params = new URLSearchParams(searchParams.toString());
-    fetch(`/api/books/detail?${params.toString()}`)
+    if (!sourceId || !bookId) return;
+    fetch('/api/books/detail', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceId,
+        bookId,
+        href: cached?.detailHref,
+        title: cached?.title,
+        author: cached?.author,
+        cover: cached?.cover,
+        summary: cached?.summary,
+        acquisitionLinks: cached?.acquisitionLinks || [],
+      }),
+    })
       .then(async (res) => {
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || '获取详情失败');
         setDetail(json);
+        cacheBookDetail(json);
       })
       .catch((err) => setError(err.message || '获取详情失败'));
-  }, [searchParams]);
+  }, [sourceId, bookId, cached]);
+
+  const readable = detail?.acquisitionLinks.find((item) => item.type.toLowerCase().includes('epub') || item.type.toLowerCase().includes('pdf'));
+  const readableFormat = readable?.type.toLowerCase().includes('pdf') ? 'pdf' : 'epub';
 
   const toggleShelf = async () => {
     if (!detail) return;
@@ -73,19 +124,18 @@ export default function BookDetailPage() {
       title: detail.title,
       author: detail.author,
       cover: detail.cover,
+      format: readableFormat,
       detailHref: detail.detailHref,
       acquisitionHref: readable?.href,
       saveTime: Date.now(),
     };
     await saveBookShelf(detail.sourceId, detail.id, item);
     setShelf((prev) => ({ ...prev, [bookKey]: item }));
+    cacheBookDetail(detail);
   };
 
   if (error) return <div className='text-sm text-red-500'>{error}</div>;
   if (!detail) return <DetailSkeleton />;
-
-  const readable = detail.acquisitionLinks.find((item) => item.type.toLowerCase().includes('epub') || item.type.toLowerCase().includes('pdf'));
-  const readableFormat = readable?.type.toLowerCase().includes('pdf') ? 'pdf' : 'epub';
 
   return (
     <div className='space-y-6'>
@@ -103,24 +153,27 @@ export default function BookDetailPage() {
             {(detail.categories || detail.tags || []).map((tag) => <span key={tag} className='rounded-full bg-gray-100 px-3 py-1 text-xs dark:bg-gray-900'>{tag}</span>)}
           </div>
           <div className='flex flex-wrap gap-3'>
-            {readable ? <Link href={`/books/read?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(href || detail.detailHref || '')}&acquisitionHref=${encodeURIComponent(readable.href)}&format=${encodeURIComponent(readableFormat)}&bookId=${encodeURIComponent(detail.id)}&title=${encodeURIComponent(detail.title)}&author=${encodeURIComponent(detail.author || '')}&cover=${encodeURIComponent(detail.cover || '')}`} className='rounded-2xl bg-sky-600 px-4 py-2 text-sm text-white'>在线阅读</Link> : null}
+            {readable ? <Link href={buildBookReadPath(detail.sourceId, detail.id)} onClick={() => cacheBookDetail(detail)} className='rounded-2xl bg-sky-600 px-4 py-2 text-sm text-white'>在线阅读</Link> : null}
             <button onClick={toggleShelf} className='rounded-2xl border border-gray-200 px-4 py-2 text-sm dark:border-gray-700'>{shelf[`${detail.sourceId}+${detail.id}`] ? '移出书架' : '加入书架'}</button>
-            {detail.acquisitionLinks[0] ? <a href={`/api/books/file?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(detail.acquisitionLinks[0].href)}`} target='_blank' rel='noreferrer' className='rounded-2xl border border-gray-200 px-4 py-2 text-sm dark:border-gray-700'>下载文件</a> : null}
+            {readable ? <button onClick={async () => { try { setFileBusy('download'); await openBookFile(detail.sourceId, detail.id, readableFormat, true, readable?.href); } catch (err) { setError((err as Error).message || '下载文件失败'); } finally { setFileBusy(''); } }} disabled={fileBusy !== ''} className='rounded-2xl border border-gray-200 px-4 py-2 text-sm dark:border-gray-700'>{fileBusy === 'download' ? '下载中...' : '下载文件'}</button> : null}
           </div>
         </div>
       </section>
       <section className='rounded-3xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-800 dark:bg-gray-950'>
         <h2 className='text-lg font-semibold'>可用格式</h2>
         <div className='mt-4 space-y-3'>
-          {detail.acquisitionLinks.map((item) => (
-            <div key={`${item.href}-${item.type}`} className='flex items-center justify-between rounded-2xl bg-gray-50 px-4 py-3 text-sm dark:bg-gray-900'>
-              <div>
-                <div>{item.title || item.type}</div>
-                <div className='text-xs text-gray-500'>{item.rel}</div>
+          {detail.acquisitionLinks.map((item) => {
+            const format = item.type.toLowerCase().includes('pdf') ? 'pdf' : item.type.toLowerCase().includes('epub') ? 'epub' : undefined;
+            return (
+              <div key={`${item.href}-${item.type}`} className='flex items-center justify-between rounded-2xl bg-gray-50 px-4 py-3 text-sm dark:bg-gray-900'>
+                <div>
+                  <div>{item.title || item.type}</div>
+                  <div className='text-xs text-gray-500'>{item.rel}</div>
+                </div>
+                <button disabled={!format || fileBusy !== ''} onClick={async () => { if (!format) return; try { setFileBusy('open'); await openBookFile(detail.sourceId, detail.id, format, false, item.href); } catch (err) { setError((err as Error).message || '打开文件失败'); } finally { setFileBusy(''); } }} className='text-sky-600 disabled:text-gray-400'>打开</button>
               </div>
-              <a href={`/api/books/file?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(item.href)}`} target='_blank' rel='noreferrer' className='text-sky-600'>打开</a>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </section>
     </div>

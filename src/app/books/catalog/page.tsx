@@ -2,23 +2,14 @@
 
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import BookCard from '@/components/books/BookCard';
+import { buildBookDetailPath, cacheBookListItem } from '@/lib/book-route-cache.client';
 import { BookCatalogResult, BookListItem, BookSource } from '@/lib/book.types';
 
 function makeHref(sourceId: string, item: BookListItem) {
-  const params = new URLSearchParams({
-    sourceId,
-    href: item.detailHref || '',
-    bookId: item.id,
-    title: item.title,
-    author: item.author || '',
-    cover: item.cover || '',
-    summary: item.summary || '',
-    acquisitionLinks: JSON.stringify(item.acquisitionLinks || []),
-  });
-  return `/books/detail?${params.toString()}`;
+  return buildBookDetailPath(sourceId, item.id);
 }
 
 function CatalogSkeleton() {
@@ -51,30 +42,175 @@ function CatalogSkeleton() {
   );
 }
 
+function LoadingMoreSkeleton() {
+  return (
+    <div className='grid grid-cols-2 gap-4 md:grid-cols-4 xl:grid-cols-6'>
+      {Array.from({ length: 6 }).map((_, index) => (
+        <div key={index} className='space-y-3 animate-pulse'>
+          <div className='aspect-[3/4] rounded-2xl bg-gray-200 dark:bg-gray-800' />
+          <div className='h-4 w-3/4 rounded bg-gray-200 dark:bg-gray-800' />
+          <div className='h-3 w-1/2 rounded bg-gray-200 dark:bg-gray-800' />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function isMeaningfulNavTitle(title?: string) {
+  const text = (title || '').trim();
+  return !!text && text !== '目录';
+}
+
 export default function BooksCatalogPage() {
   const searchParams = useSearchParams();
   const sourceId = searchParams.get('sourceId') || '';
   const href = searchParams.get('href') || '';
   const [sources, setSources] = useState<BookSource[]>([]);
   const [data, setData] = useState<BookCatalogResult | null>(null);
+  const [entries, setEntries] = useState<BookListItem[]>([]);
+  const [nextHref, setNextHref] = useState<string | undefined>(undefined);
   const [error, setError] = useState('');
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loaderRef = useRef<HTMLDivElement | null>(null);
+  const navScrollerRef = useRef<HTMLDivElement | null>(null);
+  const loadedPageHrefsRef = useRef<Set<string>>(new Set());
+  const navDragStateRef = useRef<{ pointerId: number; startX: number; startScrollLeft: number; moved: boolean } | null>(null);
 
   useEffect(() => {
     fetch('/api/books/sources').then((res) => res.json()).then((json) => setSources(json.sources || []));
   }, []);
 
+  const mergeEntries = useCallback((prev: BookListItem[], next: BookListItem[]) => {
+    const seen = new Set(prev.map((item) => `${item.sourceId}::${item.id}::${item.detailHref || item.acquisitionLinks[0]?.href || ''}`));
+    const merged = [...prev];
+    for (const item of next) {
+      const key = `${item.sourceId}::${item.id}::${item.detailHref || item.acquisitionLinks[0]?.href || ''}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(item);
+      }
+    }
+    return merged;
+  }, []);
+
+  const loadCatalog = useCallback(async (targetHref?: string, append = false) => {
+    if (!sourceId) return;
+    const normalizedHref = targetHref || '';
+    if (append) {
+      if (!normalizedHref || loadedPageHrefsRef.current.has(normalizedHref)) return;
+      setLoadingMore(true);
+    } else {
+      setError('');
+      setData(null);
+      setEntries([]);
+      setNextHref(undefined);
+      loadedPageHrefsRef.current = new Set(normalizedHref ? [normalizedHref] : ['__root__']);
+    }
+
+    try {
+      const params = new URLSearchParams({ sourceId });
+      if (normalizedHref) params.set('href', normalizedHref);
+      const res = await fetch(`/api/books/catalog?${params.toString()}`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || '获取目录失败');
+      const nextData = json as BookCatalogResult;
+      if (append) {
+        loadedPageHrefsRef.current.add(normalizedHref);
+        setEntries((prev) => mergeEntries(prev, nextData.entries || []));
+      } else {
+        setData(nextData);
+        setEntries(nextData.entries || []);
+      }
+      setNextHref(nextData.nextHref || undefined);
+      if (!append) setData(nextData);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '获取目录失败');
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [mergeEntries, sourceId]);
+
   useEffect(() => {
     if (!sourceId) return;
-    const params = new URLSearchParams({ sourceId });
-    if (href) params.set('href', href);
-    fetch(`/api/books/catalog?${params.toString()}`)
-      .then(async (res) => {
-        const json = await res.json();
-        if (!res.ok) throw new Error(json.error || '获取目录失败');
-        setData(json);
-      })
-      .catch((err) => setError(err.message || '获取目录失败'));
-  }, [sourceId, href]);
+    void loadCatalog(href, false);
+  }, [sourceId, href, loadCatalog]);
+
+  useEffect(() => {
+    const node = loaderRef.current;
+    if (!node || !nextHref || loadingMore || !data) return;
+
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (entry?.isIntersecting && nextHref && !loadingMore) {
+        void loadCatalog(nextHref, true);
+      }
+    }, { rootMargin: '800px 0px' });
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [data, nextHref, loadingMore, loadCatalog]);
+
+
+  const handleNavPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const node = navScrollerRef.current;
+    if (!node) return;
+    navDragStateRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startScrollLeft: node.scrollLeft,
+      moved: false,
+    };
+    node.setPointerCapture?.(event.pointerId);
+  }, []);
+
+  const handleNavPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const node = navScrollerRef.current;
+    const dragState = navDragStateRef.current;
+    if (!node || !dragState || dragState.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - dragState.startX;
+    if (Math.abs(deltaX) > 4) dragState.moved = true;
+    node.scrollLeft = dragState.startScrollLeft - deltaX;
+  }, []);
+
+  const handleNavPointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const node = navScrollerRef.current;
+    const dragState = navDragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) return;
+    if (dragState.moved) {
+      event.preventDefault();
+      window.setTimeout(() => {
+        navDragStateRef.current = null;
+      }, 0);
+    } else {
+      navDragStateRef.current = null;
+    }
+    node?.releasePointerCapture?.(event.pointerId);
+  }, []);
+
+  const handleNavWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    const node = navScrollerRef.current;
+    if (!node) return;
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    if (!delta) return;
+    node.scrollLeft += delta;
+    event.preventDefault();
+  }, []);
+
+  const navigationItems = useMemo(() => {
+    const items = (data?.navigation || []).filter((item) => {
+      const rel = (item.rel || '').toLowerCase();
+      if (rel === 'next' || rel === 'previous') return false;
+      return isMeaningfulNavTitle(item.title);
+    });
+
+    const seen = new Set<string>();
+    return items.filter((item) => {
+      const key = `${item.href}::${(item.title || '').trim()}`;
+      if (!item.href || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [data]);
 
   return (
     <div className='space-y-6'>
@@ -91,22 +227,30 @@ export default function BooksCatalogPage() {
           <section className='rounded-3xl border border-gray-200 bg-white p-5 shadow-sm dark:border-gray-800 dark:bg-gray-950'>
             <h1 className='text-lg font-semibold'>{data.title}</h1>
             {data.subtitle ? <p className='mt-1 text-sm text-gray-500 dark:text-gray-400'>{data.subtitle}</p> : null}
-            <div className='mt-4 flex flex-wrap gap-2'>
-              {data.previousHref ? <Link href={`/books/catalog?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(data.previousHref)}`} className='rounded-2xl border border-gray-200 px-4 py-2 text-sm dark:border-gray-700'>上一页</Link> : null}
-              {data.nextHref ? <Link href={`/books/catalog?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(data.nextHref)}`} className='rounded-2xl border border-gray-200 px-4 py-2 text-sm dark:border-gray-700'>下一页</Link> : null}
-            </div>
           </section>
-          {data.navigation.length > 0 ? (
+          {navigationItems.length > 0 ? (
             <section className='space-y-3'>
               <div className='text-sm font-medium text-gray-700 dark:text-gray-300'>目录</div>
-              <div className='flex gap-3 overflow-x-auto pb-2'>
-                {data.navigation.map((item, index) => (
+              <div
+                ref={navScrollerRef}
+                className='flex gap-3 overflow-x-auto pb-2 cursor-grab select-none touch-pan-x active:cursor-grabbing'
+                onPointerDown={handleNavPointerDown}
+                onPointerMove={handleNavPointerMove}
+                onPointerUp={handleNavPointerUp}
+                onPointerCancel={handleNavPointerUp}
+                onPointerLeave={handleNavPointerUp}
+                onWheel={handleNavWheel}
+              >
+                {navigationItems.map((item, index) => (
                   <Link
                     key={`${item.href}-${index}`}
                     href={`/books/catalog?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(item.href)}`}
+                    draggable={false}
+                    onDragStart={(event) => event.preventDefault()}
+                    onClick={(event) => { if (navDragStateRef.current?.moved) event.preventDefault(); }}
                     className='min-w-[180px] rounded-2xl border border-gray-200 bg-white p-4 text-sm shadow-sm dark:border-gray-800 dark:bg-gray-950'
                   >
-                    <div className='line-clamp-2 font-medium'>{item.title}</div>
+                    <div className='line-clamp-2 font-medium'>{item.title.trim()}</div>
                     <div className='mt-2 text-xs text-gray-500 dark:text-gray-400'>点击进入子目录</div>
                   </Link>
                 ))}
@@ -114,8 +258,10 @@ export default function BooksCatalogPage() {
             </section>
           ) : null}
           <section className='grid grid-cols-2 gap-4 md:grid-cols-4 xl:grid-cols-6'>
-            {data.entries.map((item) => <BookCard key={`${item.sourceId}-${item.id}`} item={item} href={makeHref(sourceId, item)} />)}
+            {entries.map((item) => <BookCard key={`${item.sourceId}-${item.id}-${item.detailHref || item.acquisitionLinks[0]?.href || ''}`} item={item} href={makeHref(sourceId, item)} onNavigate={() => cacheBookListItem(item)} />)}
           </section>
+          {loadingMore ? <LoadingMoreSkeleton /> : null}
+          {!loadingMore && nextHref ? <div ref={loaderRef} className='h-8 w-full' /> : null}
         </>
       ) : !error ? <CatalogSkeleton /> : null}
     </div>

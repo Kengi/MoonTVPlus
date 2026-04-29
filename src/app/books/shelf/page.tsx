@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 
+import { buildBookDetailPath, cacheBookShelfItem } from '@/lib/book-route-cache.client';
 import { deleteBookShelf, getAllBookShelf } from '@/lib/book.db.client';
 import { BookShelfItem } from '@/lib/book.types';
 
@@ -28,7 +29,7 @@ export default function BookShelfPage() {
                 <div className='mt-1 text-sm text-gray-500'>{item.author || item.sourceName}</div>
                 <div className='mt-2 text-xs text-gray-500'>进度 {Math.round(item.progressPercent || 0)}%</div>
                 <div className='mt-3 flex flex-wrap gap-2'>
-                  <Link href={`/books/detail?sourceId=${encodeURIComponent(item.sourceId)}&href=${encodeURIComponent(item.detailHref || '')}&bookId=${encodeURIComponent(item.bookId)}&title=${encodeURIComponent(item.title)}&author=${encodeURIComponent(item.author || '')}&cover=${encodeURIComponent(item.cover || '')}`} className='rounded-2xl bg-sky-600 px-3 py-2 text-xs text-white'>详情</Link>
+                  <Link href={buildBookDetailPath(item.sourceId, item.bookId)} onClick={() => cacheBookShelfItem(item)} className='rounded-2xl bg-sky-600 px-3 py-2 text-xs text-white'>详情</Link>
                   <button onClick={async () => { await deleteBookShelf(item.sourceId, item.bookId); setShelf((prev) => { const next = { ...prev }; delete next[`${item.sourceId}+${item.bookId}`]; return next; }); }} className='rounded-2xl border border-gray-200 px-3 py-2 text-xs dark:border-gray-700'>移除</button>
                 </div>
               </div>

@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 
+import { buildBookReadPath, cacheBookReadRecord, cacheBookShelfItem } from '@/lib/book-route-cache.client';
 import { deleteBookReadRecord, getAllBookReadRecords, getAllBookShelf } from '@/lib/book.db.client';
 import { BookReadRecord, BookShelfItem } from '@/lib/book.types';
 
@@ -47,19 +48,8 @@ export default function BookHistoryPage() {
               <div className='mt-3 flex flex-wrap gap-2'>
                 {item.sourceId ? (
                   <Link
-                    href={{
-                      pathname: '/books/read',
-                      query: {
-                        sourceId: item.sourceId,
-                        href: item.detailHref || '',
-                        acquisitionHref: item.acquisitionHref || '',
-                        format: item.format,
-                        bookId: item.bookId,
-                        title: item.title,
-                        author: item.author || '',
-                        cover: item.cover || '',
-                      },
-                    }}
+                    href={buildBookReadPath(item.sourceId, item.bookId)}
+                    onClick={() => { cacheBookReadRecord(item); if (item.sourceId && item.bookId) { cacheBookShelfItem({ sourceId: item.sourceId, sourceName: item.sourceName, bookId: item.bookId, title: item.title, author: item.author, cover: item.cover, format: item.format, detailHref: item.detailHref, acquisitionHref: item.acquisitionHref, saveTime: item.saveTime }); } }}
                     className='rounded-2xl bg-sky-600 px-3 py-2 text-xs text-white'
                   >
                     继续阅读

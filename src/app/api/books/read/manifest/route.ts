@@ -1,24 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { BookAcquisitionLink } from '@/lib/book.types';
-import { opdsClient } from '@/lib/opds.client';
 import { db } from '@/lib/db';
+import { opdsClient } from '@/lib/opds.client';
 
 import { getAuthorizedBooksUsername } from '../../_utils';
 
 export const runtime = 'nodejs';
 
-export async function GET(request: NextRequest) {
-  const username = await getAuthorizedBooksUsername(request);
-  if (username instanceof NextResponse) return username;
+type ManifestPayload = {
+  sourceId?: string;
+  bookId?: string;
+  href?: string;
+  acquisitionHref?: string;
+  format?: 'epub' | 'pdf' | null;
+  title?: string;
+  author?: string;
+  cover?: string;
+  summary?: string;
+};
 
+async function resolveManifest(username: string, payload: ManifestPayload) {
   try {
-    const { searchParams } = new URL(request.url);
-    const sourceId = searchParams.get('sourceId')?.trim();
-    const href = searchParams.get('href')?.trim();
-    const acquisitionHref = searchParams.get('acquisitionHref')?.trim();
-    const format = searchParams.get('format')?.trim() as 'epub' | 'pdf' | null;
-    const bookId = searchParams.get('bookId')?.trim();
+    const sourceId = payload.sourceId?.trim();
+    const href = payload.href?.trim();
+    const acquisitionHref = payload.acquisitionHref?.trim();
+    const format = payload.format;
+    const bookId = payload.bookId?.trim();
 
     if (!sourceId) {
       return NextResponse.json({ error: '缺少 sourceId' }, { status: 400 });
@@ -44,10 +52,10 @@ export async function GET(request: NextRequest) {
 
     const detail = await opdsClient.getBookDetail(sourceId, resolvedHref || '', {
       id: bookId || resolvedAcquisitionHref || undefined,
-      title: searchParams.get('title') || existingRecord?.title || shelfItem?.title || undefined,
-      author: searchParams.get('author') || existingRecord?.author || shelfItem?.author || undefined,
-      cover: searchParams.get('cover') || existingRecord?.cover || shelfItem?.cover || undefined,
-      summary: searchParams.get('summary') || undefined,
+      title: payload.title || existingRecord?.title || shelfItem?.title || undefined,
+      author: payload.author || existingRecord?.author || shelfItem?.author || undefined,
+      cover: payload.cover || existingRecord?.cover || shelfItem?.cover || undefined,
+      summary: payload.summary || undefined,
       detailHref: resolvedHref || undefined,
       acquisitionLinks: fallbackAcquisitionLinks,
     });
@@ -62,12 +70,35 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       book: detail,
       format: preferred.format,
-      fileUrl: `/api/books/file?sourceId=${encodeURIComponent(sourceId)}&href=${encodeURIComponent(preferred.href)}`,
+      fileUrl: `/api/books/file?sourceId=${encodeURIComponent(sourceId)}&bookId=${encodeURIComponent(detail.id)}&format=${encodeURIComponent(preferred.format)}`,
       acquisitionHref: preferred.href,
-      cacheKey: `${sourceId}::${detail.id}::${preferred.href}`,
+      cacheKey: `${sourceId}::${detail.id}::${preferred.format}`,
       coverUrl: detail.cover,
       lastRecord,
     });
+  } catch (error) {
+    return NextResponse.json({ error: (error as Error).message }, { status: 500 });
+  }
+}
+
+export async function GET(request: NextRequest) {
+  const username = await getAuthorizedBooksUsername(request);
+  if (username instanceof NextResponse) return username;
+
+  const { searchParams } = new URL(request.url);
+  return resolveManifest(username, {
+    sourceId: searchParams.get('sourceId') || undefined,
+    bookId: searchParams.get('bookId') || undefined,
+  });
+}
+
+export async function POST(request: NextRequest) {
+  const username = await getAuthorizedBooksUsername(request);
+  if (username instanceof NextResponse) return username;
+
+  try {
+    const payload = await request.json() as ManifestPayload;
+    return await resolveManifest(username, payload);
   } catch (error) {
     return NextResponse.json({ error: (error as Error).message }, { status: 500 });
   }

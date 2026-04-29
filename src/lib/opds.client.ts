@@ -363,20 +363,22 @@ export class OPDSClient {
       href: normalizeUrl(source.url, href || source.url),
       entries: bookEntries.map((entry) => mapEntryToItem(source, entry)),
       navigation: [
-        ...feed.links.filter((link) => isNavigationLink(link)).map((link) => ({
-          title: link.title || '目录',
-          href: link.href,
-          rel: link.rel,
-          type: link.type,
-        })),
+        ...feed.links
+          .filter((link) => isNavigationLink(link) && link.rel !== 'next' && link.rel !== 'previous' && !!(link.title || '').trim())
+          .map((link) => ({
+            title: (link.title || '').trim(),
+            href: link.href,
+            rel: link.rel,
+            type: link.type,
+          })),
         ...navigationEntries
           .map((entry) => ({
-            title: entry.title,
+            title: (entry.title || '').trim(),
             href: pickDetailHref(entry.links) || entry.links.find((link) => isNavigationLink(link))?.href || '',
             rel: entry.links.find((link) => isNavigationLink(link))?.rel,
             type: entry.links.find((link) => isNavigationLink(link))?.type,
           }))
-          .filter((item) => !!item.href),
+          .filter((item) => !!item.href && !!item.title && item.title !== '目录'),
       ],
       nextHref: feed.links.find((link) => link.rel === 'next')?.href,
       previousHref: feed.links.find((link) => link.rel === 'previous')?.href,

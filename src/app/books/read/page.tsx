@@ -11,6 +11,7 @@ import {
   putCachedBookFile,
   touchCachedBookFile,
 } from '@/lib/book-cache.client';
+import { cacheBookDetail, getBookRouteCache } from '@/lib/book-route-cache.client';
 import { saveBookReadRecord } from '@/lib/book.db.client';
 import { BookReadManifest } from '@/lib/book.types';
 
@@ -141,10 +142,20 @@ function flattenToc(items: TocItem[]): TocItem[] {
 }
 
 async function downloadBookWithProgress(
-  url: string,
+  manifest: Pick<BookReadManifest, 'book' | 'format' | 'acquisitionHref'>,
   onProgress: (received: number, total: number | null) => void
 ): Promise<Blob> {
-  const response = await fetch(url, { cache: 'force-cache' });
+  const response = await fetch('/api/books/file', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sourceId: manifest.book.sourceId,
+      bookId: manifest.book.id,
+      format: manifest.format,
+      href: manifest.acquisitionHref || undefined,
+    }),
+    cache: 'force-cache',
+  });
   if (!response.ok) throw new Error(`下载电子书失败: ${response.status}`);
   const total = Number(response.headers.get('content-length') || '') || null;
   if (!response.body) {
@@ -173,6 +184,24 @@ async function downloadBookWithProgress(
   return new Blob(chunks, { type: response.headers.get('content-type') || 'application/epub+zip' });
 }
 
+
+function normalizeHrefForMatch(href?: string) {
+  if (!href) return '';
+  try {
+    const normalized = decodeURIComponent(href).replace(/\\/g, '/').trim();
+    return normalized.split('#')[0].split('?')[0].replace(/^\.\//, '').replace(/^\//, '');
+  } catch {
+    return href.split('#')[0].split('?')[0].replace(/^\.\//, '').replace(/^\//, '').trim();
+  }
+}
+
+function isSameTocTarget(currentHref?: string, tocHref?: string) {
+  const current = normalizeHrefForMatch(currentHref);
+  const target = normalizeHrefForMatch(tocHref);
+  if (!current || !target) return false;
+  return current === target || current.endsWith(target) || target.endsWith(current);
+}
+
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
@@ -182,7 +211,8 @@ function formatBytes(size: number): string {
 export default function BookReadPage() {
   const searchParams = useSearchParams();
   const sourceId = searchParams.get('sourceId') || '';
-  const href = searchParams.get('href') || '';
+  const bookId = searchParams.get('bookId') || '';
+  const cached = useMemo(() => (sourceId && bookId ? getBookRouteCache(sourceId, bookId) : null), [sourceId, bookId]);
   const [manifest, setManifest] = useState<BookReadManifest | null>(null);
   const [error, setError] = useState('');
   const [ready, setReady] = useState(false);
@@ -199,7 +229,10 @@ export default function BookReadPage() {
   const [progressPercent, setProgressPercent] = useState(0);
   const [restoredMessage, setRestoredMessage] = useState('');
   const [controlsVisible, setControlsVisible] = useState(true);
+  const [pdfBlobUrl, setPdfBlobUrl] = useState('');
   const viewerRef = useRef<HTMLDivElement | null>(null);
+  const tocScrollRef = useRef<HTMLDivElement | null>(null);
+  const tocItemRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const bookRef = useRef<EpubBookInstance | null>(null);
   const renditionRef = useRef<EpubRendition | null>(null);
   const saveTimerRef = useRef<number | null>(null);
@@ -218,25 +251,57 @@ export default function BookReadPage() {
     }
   }, [settings]);
 
+
   useEffect(() => {
-    const params = new URLSearchParams({
-      sourceId,
-      href,
-      acquisitionHref: searchParams.get('acquisitionHref') || '',
-      format: searchParams.get('format') || '',
-      bookId: searchParams.get('bookId') || '',
-      title: searchParams.get('title') || '',
-      author: searchParams.get('author') || '',
-      cover: searchParams.get('cover') || '',
-    });
-    fetch(`/api/books/read/manifest?${params.toString()}`)
+    const handleToggleSettings = () => {
+      setSettingsOpen((prev) => !prev);
+      setTocOpen(false);
+    };
+
+    window.addEventListener('books-read-toggle-settings', handleToggleSettings);
+    return () => {
+      window.removeEventListener('books-read-toggle-settings', handleToggleSettings);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleToggleChapters = () => {
+      setTocOpen((prev) => !prev);
+      setSettingsOpen(false);
+    };
+
+    window.addEventListener('books-read-toggle-chapters', handleToggleChapters);
+    return () => {
+      window.removeEventListener('books-read-toggle-chapters', handleToggleChapters);
+    };
+  }, []);
+
+
+  useEffect(() => {
+    if (!sourceId || !bookId) return;
+    fetch('/api/books/read/manifest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceId,
+        bookId,
+        href: cached?.detailHref,
+        acquisitionHref: cached?.acquisitionHref,
+        format: cached?.format || null,
+        title: cached?.title,
+        author: cached?.author,
+        cover: cached?.cover,
+        summary: cached?.summary,
+      }),
+    })
       .then(async (res) => {
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || '获取阅读信息失败');
         setManifest(json);
+        cacheBookDetail(json.book);
       })
       .catch((err) => setError(err.message || '获取阅读信息失败'));
-  }, [sourceId, href, searchParams]);
+  }, [sourceId, bookId, cached]);
 
   const saveProgress = useMemo(() => {
     return async (location: EpubLocation, nextProgress = 0, chapterTitle?: string) => {
@@ -312,10 +377,11 @@ export default function BookReadPage() {
       renditionRef.current?.next?.();
       return;
     }
-    setControlsVisible((prev) => !prev);
     setTocOpen(false);
     setSettingsOpen(false);
   }, [ready]);
+
+
 
   useEffect(() => {
     if (!manifest || manifest.format !== 'epub' || !viewerRef.current) return;
@@ -337,7 +403,7 @@ export default function BookReadPage() {
         const cacheKey = manifest.cacheKey || buildBookCacheKey(
           manifest.book.sourceId,
           manifest.book.id,
-          manifest.acquisitionHref || manifest.fileUrl
+          manifest.acquisitionHref || `${manifest.book.sourceId}:${manifest.book.id}:${manifest.format}`
         );
 
         let fileBuffer: ArrayBuffer;
@@ -351,7 +417,7 @@ export default function BookReadPage() {
           fileBuffer = await cached.blob.arrayBuffer();
         } else {
           setFileLoadState('downloading');
-          const blob = await downloadBookWithProgress(manifest.fileUrl, (received, total) => {
+          const blob = await downloadBookWithProgress(manifest, (received, total) => {
             if (!destroyed) {
               setDownloadedBytes(received);
               setTotalBytes(total);
@@ -364,7 +430,7 @@ export default function BookReadPage() {
             bookId: manifest.book.id,
             title: manifest.book.title,
             format: manifest.format,
-            acquisitionHref: manifest.acquisitionHref || manifest.fileUrl,
+            acquisitionHref: manifest.acquisitionHref || `${manifest.book.sourceId}:${manifest.book.id}:${manifest.format}`,
             blob,
             size: blob.size,
             mimeType: blob.type || 'application/epub+zip',
@@ -397,16 +463,43 @@ export default function BookReadPage() {
         applyReaderTheme(settings);
 
         const restoreTarget = manifest.lastRecord?.locator?.value || undefined;
-        await navigateToTarget(restoreTarget);
-        window.clearTimeout(readyFallbackTimer);
-        if (destroyed) return;
-        setReady(true);
-        setFileLoadState('ready');
+        let restoreMessageShown = false;
 
-        if (restoreTarget) {
-          setRestoredMessage(`已恢复到上次阅读位置（约 ${Math.round(manifest.lastRecord?.progressPercent || 0)}%）`);
-          window.setTimeout(() => setRestoredMessage(''), 3000);
-        }
+        rendition.on('relocated', (location: EpubLocation) => {
+          if (!destroyed) {
+            window.clearTimeout(readyFallbackTimer);
+            setReady(true);
+            setFileLoadState('ready');
+          }
+          if (restoreTarget && !restoreMessageShown) {
+            restoreMessageShown = true;
+            setRestoredMessage(`已恢复到上次阅读位置（约 ${Math.round(manifest.lastRecord?.progressPercent || 0)}%）`);
+            window.setTimeout(() => setRestoredMessage(''), 3000);
+          }
+          lastLocationRef.current = location;
+          const chapterTitle = location?.start?.displayed?.chapter || location?.start?.href || manifest.book.title;
+          const cfi = location?.start?.cfi || '';
+          const computedProgress = locationsReadyRef.current && cfi
+            ? Math.max(0, Math.min(100, (book.locations?.percentageFromCfi?.(cfi) || 0) * 100))
+            : null;
+          const normalizedProgress = computedProgress ?? lastProgressRef.current ?? manifest.lastRecord?.progressPercent ?? 0;
+          setProgressPercent(normalizedProgress);
+          setCurrentChapter(chapterTitle);
+          setCurrentHref(location?.start?.href || '');
+          lastProgressRef.current = normalizedProgress;
+          lastChapterRef.current = chapterTitle;
+          if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+          saveTimerRef.current = window.setTimeout(() => {
+            void saveProgress(location, normalizedProgress, chapterTitle);
+          }, locationsReadyRef.current ? 1500 : 3500);
+        });
+
+        void navigateToTarget(restoreTarget).catch(() => {
+          if (!destroyed) {
+            setReady(true);
+            setFileLoadState('ready');
+          }
+        });
 
         void (async () => {
           try {
@@ -432,25 +525,6 @@ export default function BookReadPage() {
             // ignore
           }
         })();
-
-        rendition.on('relocated', (location: EpubLocation) => {
-          lastLocationRef.current = location;
-          const chapterTitle = location?.start?.displayed?.chapter || location?.start?.href || manifest.book.title;
-          const cfi = location?.start?.cfi || '';
-          const computedProgress = locationsReadyRef.current && cfi
-            ? Math.max(0, Math.min(100, (book.locations?.percentageFromCfi?.(cfi) || 0) * 100))
-            : null;
-          const normalizedProgress = computedProgress ?? lastProgressRef.current ?? manifest.lastRecord?.progressPercent ?? 0;
-          setProgressPercent(normalizedProgress);
-          setCurrentChapter(chapterTitle);
-          setCurrentHref(location?.start?.href || '');
-          lastProgressRef.current = normalizedProgress;
-          lastChapterRef.current = chapterTitle;
-          if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-          saveTimerRef.current = window.setTimeout(() => {
-            void saveProgress(location, normalizedProgress, chapterTitle);
-          }, locationsReadyRef.current ? 1500 : 3500);
-        });
       })
       .catch((err) => {
         setReady(false);
@@ -479,47 +553,84 @@ export default function BookReadPage() {
     };
   }, [persistCurrentProgress]);
 
+
+  useEffect(() => {
+    if (!manifest || manifest.format !== 'pdf') return;
+    let revokedUrl = '';
+    let cancelled = false;
+    setFileLoadState('downloading');
+    setDownloadedBytes(0);
+    setTotalBytes(null);
+    setPdfBlobUrl('');
+
+    downloadBookWithProgress(manifest, (received, total) => {
+      if (!cancelled) {
+        setDownloadedBytes(received);
+        setTotalBytes(total);
+      }
+    })
+      .then(async (blob) => {
+        if (cancelled) return;
+        const objectUrl = URL.createObjectURL(blob);
+        revokedUrl = objectUrl;
+        setPdfBlobUrl(objectUrl);
+        setFileLoadState('ready');
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message || 'PDF 加载失败');
+      });
+
+    return () => {
+      cancelled = true;
+      if (revokedUrl) URL.revokeObjectURL(revokedUrl);
+    };
+  }, [manifest]);
+
+
+  useEffect(() => {
+    if (!manifest) return;
+    window.dispatchEvent(new CustomEvent('books-read-update-header', {
+      detail: {
+        title: manifest.book.title,
+        subtitle: currentChapter || manifest.book.author || '分页阅读',
+        backHref: `/books/detail?sourceId=${encodeURIComponent(manifest.book.sourceId)}&bookId=${encodeURIComponent(manifest.book.id)}`,
+      },
+    }));
+  }, [manifest, currentChapter]);
+
   const flatToc = useMemo(() => flattenToc(tocItems), [tocItems]);
   const activeTocHref = useMemo(
-    () => flatToc.find((item) => currentHref.includes(item.href) || item.href.includes(currentHref))?.href || '',
+    () => flatToc.find((item) => isSameTocTarget(currentHref, item.href))?.href || '',
     [flatToc, currentHref]
   );
+
+  useEffect(() => {
+    if (!tocOpen || !activeTocHref) return;
+    const activeNode = tocItemRefs.current[activeTocHref];
+    if (!activeNode) return;
+    activeNode.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [tocOpen, activeTocHref]);
+
   const progressLabel = totalBytes ? `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}` : formatBytes(downloadedBytes);
 
   if (error) return <div className='p-4 text-sm text-red-500'>{error}</div>;
   if (!manifest) return <div className='p-4 text-sm text-gray-500'>准备阅读器中...</div>;
 
   if (manifest.format === 'pdf') {
-    return <iframe src={manifest.fileUrl} className='h-[calc(100vh-4rem)] w-full bg-white' title={manifest.book.title} />;
+    if (!pdfBlobUrl) return <div className='p-4 text-sm text-gray-500'>PDF 加载中... {progressLabel}</div>;
+    return <iframe src={pdfBlobUrl} className='h-[calc(100vh-4rem)] w-full bg-white' title={manifest.book.title} />;
   }
 
   return (
-    <div className='relative h-[calc(100vh-4rem)] overflow-hidden bg-white dark:bg-gray-950'>
-      <div className={`flex h-14 items-center justify-between border-b border-gray-200 bg-white px-4 text-sm shadow-sm transition-all dark:border-gray-800 dark:bg-gray-950 ${controlsVisible ? 'translate-y-0 opacity-100' : '-translate-y-full opacity-0 pointer-events-none'}`}>
-        <div className='min-w-0'>
-          <div className='truncate font-medium'>{manifest.book.title}</div>
-          <div className='truncate text-xs text-gray-500 dark:text-gray-400'>
-            {currentChapter || manifest.book.author || 'EPUB 阅读'} · {Math.round(progressPercent)}%
-          </div>
-        </div>
-        <div className='flex items-center gap-2'>
-          <button onClick={() => setTocOpen((prev) => !prev)} className='inline-flex h-9 w-9 items-center justify-center rounded-full border border-gray-200 dark:border-gray-700'>
-            <List className='h-4 w-4' />
-          </button>
-          <button onClick={() => setSettingsOpen((prev) => !prev)} className='inline-flex h-9 w-9 items-center justify-center rounded-full border border-gray-200 dark:border-gray-700'>
-            <Settings2 className='h-4 w-4' />
-          </button>
-        </div>
-      </div>
-
+    <div className='relative h-[calc(100vh-3.5rem)] overflow-hidden bg-white dark:bg-gray-950'>
       {restoredMessage ? (
-        <div className='absolute left-1/2 top-16 z-30 -translate-x-1/2 rounded-full bg-sky-600 px-4 py-2 text-xs text-white shadow-lg'>
+        <div className='absolute left-1/2 top-4 z-30 -translate-x-1/2 rounded-full bg-sky-600 px-4 py-2 text-xs text-white shadow-lg'>
           {restoredMessage}
         </div>
       ) : null}
 
       {!ready ? (
-        <div className='absolute inset-x-0 top-14 z-10 p-4'>
+        <div className='absolute inset-x-0 top-0 z-10 p-4'>
           <div className='mx-auto max-w-3xl space-y-4'>
             <div className='space-y-2 rounded-3xl border border-gray-200 bg-white/90 p-5 shadow-sm dark:border-gray-800 dark:bg-gray-950/90'>
               <div className='text-sm font-medium text-gray-700 dark:text-gray-300'>
@@ -556,7 +667,7 @@ export default function BookReadPage() {
       {tocOpen && (
         <div className='fixed inset-0 z-40 bg-black/30' onClick={() => setTocOpen(false)}>
           <div
-            className='absolute right-0 top-14 h-[calc(100vh-3.5rem)] w-full max-w-sm overflow-y-auto border-l border-gray-200 bg-white shadow-xl dark:border-gray-700 dark:bg-gray-950'
+            className='absolute right-0 top-0 h-[calc(100vh-3.5rem)] w-full max-w-sm overflow-y-auto border-l border-gray-200 bg-white shadow-xl dark:border-gray-700 dark:bg-gray-950'
             onClick={(event) => event.stopPropagation()}
           >
             <div className='p-4'>
@@ -564,7 +675,7 @@ export default function BookReadPage() {
                 <div className='flex items-center gap-2 text-sm font-medium text-gray-900 dark:text-gray-100'><BookOpen className='h-4 w-4' />目录</div>
                 <button onClick={() => setTocOpen(false)} className='text-xs text-gray-500'>关闭</button>
               </div>
-              <div className='space-y-2'>
+              <div ref={tocScrollRef} className='space-y-2'>
                 {flatToc.length === 0 ? (
                   <div className='p-3 text-sm text-gray-500'>当前 EPUB 未提供目录</div>
                 ) : (
@@ -573,11 +684,14 @@ export default function BookReadPage() {
                     return (
                       <button
                         key={`${item.href}-${item.label}`}
+                        ref={(node) => {
+                          tocItemRefs.current[item.href] = node;
+                        }}
                         onClick={() => {
                           void navigateToTarget(item.href);
                           setTocOpen(false);
                         }}
-                        className={`block w-full rounded-2xl px-4 py-3 text-left text-sm transition ${active ? 'bg-sky-600 text-white' : 'text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900'}`}
+                        className={`block w-full rounded-2xl px-4 py-3 text-left text-sm transition ${active ? 'bg-sky-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900'}`}
                       >
                         {item.label}
                       </button>
@@ -646,15 +760,16 @@ export default function BookReadPage() {
         </div>
       )}
 
+
       {ready && !tocOpen && !settingsOpen ? (
-        <div className='absolute inset-x-0 top-14 bottom-0 z-10 grid grid-cols-3'>
+        <div className='absolute inset-0 z-10 grid grid-cols-3'>
           <button aria-label='上一页' className='h-full w-full cursor-pointer bg-transparent' onClick={() => handleReaderTap('left')} />
           <button aria-label='切换工具栏' className='h-full w-full cursor-pointer bg-transparent' onClick={() => handleReaderTap('center')} />
           <button aria-label='下一页' className='h-full w-full cursor-pointer bg-transparent' onClick={() => handleReaderTap('right')} />
         </div>
       ) : null}
 
-      <div ref={viewerRef} className='h-[calc(100%-3.5rem)] w-full' style={{ backgroundColor: THEME_STYLES[settings.theme].panelBg }} />
+      <div ref={viewerRef} className='h-full w-full' style={{ backgroundColor: THEME_STYLES[settings.theme].panelBg }} />
     </div>
   );
 }

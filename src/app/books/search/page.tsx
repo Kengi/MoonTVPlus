@@ -4,20 +4,11 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
 
 import BookCard from '@/components/books/BookCard';
+import { buildBookDetailPath, cacheBookListItem } from '@/lib/book-route-cache.client';
 import { BookListItem, BookSearchResult, BookSource } from '@/lib/book.types';
 
 function detailHref(item: BookListItem) {
-  const params = new URLSearchParams({
-    sourceId: item.sourceId,
-    href: item.detailHref || '',
-    bookId: item.id,
-    title: item.title,
-    author: item.author || '',
-    cover: item.cover || '',
-    summary: item.summary || '',
-    acquisitionLinks: JSON.stringify(item.acquisitionLinks || []),
-  });
-  return `/books/detail?${params.toString()}`;
+  return buildBookDetailPath(item.sourceId, item.id);
 }
 
 function SearchSkeleton() {
@@ -75,7 +66,7 @@ export default function BooksSearchPage() {
       {loading ? <SearchSkeleton /> : null}
       {result.failedSources.length > 0 ? <div className='rounded-2xl bg-amber-50 p-4 text-sm text-amber-700 dark:bg-amber-950/20 dark:text-amber-300'>{result.failedSources.map((item) => `${item.sourceName}: ${item.error}`).join('；')}</div> : null}
       <section className='grid grid-cols-2 gap-4 md:grid-cols-4 xl:grid-cols-6'>
-        {result.results.map((item) => <BookCard key={`${item.sourceId}-${item.id}`} item={item} href={detailHref(item)} />)}
+        {result.results.map((item) => <BookCard key={`${item.sourceId}-${item.id}`} item={item} href={detailHref(item)} onNavigate={() => cacheBookListItem(item)} />)}
       </section>
       {!loading && result.results.length === 0 ? <div className='text-sm text-gray-500'>暂无结果</div> : null}
     </div>
